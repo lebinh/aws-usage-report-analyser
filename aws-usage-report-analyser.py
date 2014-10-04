@@ -1,3 +1,5 @@
+# !/usr/bin/env python
+
 """usage_report
 
 Usage:
@@ -6,6 +8,7 @@ Usage:
 Options:
     -a, --stacked  Draw a stacked line / bar chart
     -b, --bar-chart  Draw bar chart instead of the default Line chart
+    -d, --daily  Force daily report even if hourly data are available
     -t <usage type>, --usage-type=<usage type>  UsageType in report to visualise [default: APS1-DataTransfer-Out-Bytes]
     -l <limit>, --limit=<limit>  Limit the number of resource included  [default: 10]
     -s <start time>, --start-time=<start time>  Fixed first day of the report (yy-mm-dd)
@@ -13,7 +16,7 @@ Options:
     -x <resource>, --exclude=<resource>  Exclude this resource from report
 """
 import csv
-import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 from itertools import chain
 import sys
@@ -33,35 +36,42 @@ def read_report(path):
         return list(csv.DictReader(f))
 
 
-def group_usage_by_resource(report, usage_type, value_type=int):
-    """ Group usage value by resource end start time for given usage type """
-    result = defaultdict(lambda: defaultdict(value_type))  # map: { resource -> { time -> usage } }
-    for record in report:
-        if record[' UsageType'] == usage_type and record[' Resource'] not in args['--exclude']:
-            time = datetime.datetime.strptime(record[' StartTime'], '%m/%d/%y %H:%M:%S')
-            if args['--start-time'] is not None and time < args['--start-time']:
-                continue
-            if args['--end-time'] is not None and time > args['--end-time']:
-                continue
-            result[record[' Resource']][time] += value_type(record[' UsageValue'])
-    return result
+def parse_record_time(record):
+    return datetime.strptime(record[' StartTime'], '%m/%d/%y %H:%M:%S')
 
 
-def get_time_range(usage_data):
-    start_time = args['--start-time']
-    end_time = args['--end-time']
-    hourly = False
-    if start_time is None or end_time is None:
-        for usage in usage_data.values():
-            for time in usage:
-                if time.hour != 0:
-                    hourly = True
-                if start_time is None or start_time > time:
-                    start_time = time
-                if end_time is None or end_time < time:
-                    end_time = time
+def filter_report(report, args):
+    """ Filter for only interested records of given type and time frame """
+    report = (record for record in report if record[' UsageType'] == args['--usage-type'])
+    report = (record for record in report if record[' Resource'] not in args['--exclude'])
+    report = ((parse_record_time(record), record) for record in report)
+    if args['--start-time'] is not None:
+        report = ((time, record) for time, record in report if time > args['--start-time'])
+    if args['--end-time'] is not None:
+        report = ((time, record) for time, record in report if time < args['--end-time'])
+    return report
 
-    delta = datetime.timedelta(0, 3600) if hourly else datetime.timedelta(1)
+
+def group_usage(report, force_daily=False, value_type=int):
+    """ Group usage value by resource and time """
+    usage = defaultdict(lambda: defaultdict(value_type))  # map: { resource -> { time -> usage } }
+    for time, record in report:
+        if force_daily:
+            time = time.date()
+        usage[record[' Resource']][time] += value_type(record[' UsageValue'])
+    return usage
+
+
+def get_time_range(start_time, end_time, usage_data, force_daily=False):
+    times = set(chain.from_iterable(usage_data.values()))
+    start_time = min(times) if start_time is None else start_time
+    end_time = max(times) if end_time is None else end_time
+
+    if is_hourly(times) and not force_daily:
+        delta = timedelta(0, 3600)
+    else:
+        delta = timedelta(1)
+
     while start_time < end_time:
         yield start_time
         start_time += delta
@@ -69,12 +79,12 @@ def get_time_range(usage_data):
 
 def is_hourly(time_range):
     for time in time_range:
-        if time.hour != 0:
+        if isinstance(time, datetime) and time.hour != 0:
             return True
     return False
 
 
-def init_chart():
+def init_chart(args):
     config = pygal.config.Config()
     config.human_readable = True
     config.legend_at_bottom = True
@@ -98,25 +108,26 @@ def init_chart():
             return pygal.Line(config=config)
 
 
-def build_usage_chart(usage_data, usage_type, limit=10):
-    time_range = list(get_time_range(usage_data))
+def build_usage_chart(usage_data, args):
+    time_range = list(get_time_range(args['--start-time'], args['--end-time'], usage_data, args['--daily']))
 
     total = 0
+    # sum total usage for each resource, used to sort and limit resources to be showed
     for resource, usage in usage_data.items():
         usage['sum'] = sum(usage.values())
         total += usage['sum']
     resources = sorted(usage_data.keys(), key=lambda r: usage_data[r]['sum'], reverse=True)
-    if limit > 0:
-        resources = resources[:limit]
+    if args['--limit'] > 0:
+        resources = resources[:args['--limit']]
 
-    chart = init_chart()
+    chart = init_chart(args)
     if is_hourly(time_range):
         label_format = '%Y-%m-%d %H:%M'
     else:
         label_format = '%Y-%m-%d'
     chart.config.x_labels = [time.strftime(label_format) for time in time_range]
     chart.config.title = '%s from %s to %s [total: %s]' % (
-        usage_type, chart.config.x_labels[0], chart.config.x_labels[-1], pygal.util.humanize(total))
+        args['--usage-type'], chart.config.x_labels[0], chart.config.x_labels[-1], pygal.util.humanize(total))
 
     for resource in resources:
         values = [
@@ -131,21 +142,23 @@ def build_usage_chart(usage_data, usage_type, limit=10):
 
 
 def main():
+    args = docopt(__doc__)
+    args['--limit'] = int(args['--limit'])
+    if args['--start-time'] is not None:
+        args['--start-time'] = datetime.strptime(args['--start-time'], '%y-%m-%d')
+    if args['--end-time'] is not None:
+        args['--end-time'] = datetime.strptime(args['--end-time'], '%y-%m-%d')
+
     reports = (read_report(path) for path in args['<reports.csv>'])
     report = chain.from_iterable(reports)
-    usage = group_usage_by_resource(report, args['--usage-type'])
+    report = filter_report(report, args)
+    usage = group_usage(report, force_daily=args['--daily'])
     if not usage:
         print('No data in specified period.')
         sys.exit(1)
-    chart = build_usage_chart(usage, args['--usage-type'], limit=args['--limit'])
+    chart = build_usage_chart(usage, args)
     chart.render_in_browser()
 
 
 if __name__ == '__main__':
-    args = docopt(__doc__)
-    if args['--start-time'] is not None:
-        args['--start-time'] = datetime.datetime.strptime(args['--start-time'], '%y-%m-%d')
-    if args['--end-time'] is not None:
-        args['--end-time'] = datetime.datetime.strptime(args['--end-time'], '%y-%m-%d')
-    args['--limit'] = int(args['--limit'])
     main()
